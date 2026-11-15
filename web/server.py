@@ -1,15 +1,16 @@
 # -*- coding: utf-8 -*-
-"""网页服务：展示最新采集的数据（零第三方依赖，只用标准库）
+"""网页服务：展示最新采集的数据 + 地图点选选址评估（零第三方依赖，只用标准库）
 
 启动：
     python web/server.py                默认 http://127.0.0.1:5000
     python web/server.py 8080           换端口
 
 页面：
-    /                     总览（自动每 30 秒刷新，显示数据时间）
+    /                     总览（自动刷新）+ 地图点选评估
     /stores?city=深圳&kw=&page=1   门店列表（搜索 + 分页）
-    /api/summary?city=深圳          JSON 接口（给前端/别人调用）
-    /chart.png?city=深圳            密度图（按需生成，数据变了自动重画）
+    /api/summary?city=深圳          JSON：汇总
+    /api/site?city=深圳&lng=114.06&lat=22.53   JSON：该点适不适合开店
+    /chart.png?city=深圳            密度图（按需生成）
 
 为什么"实时"：每次请求都重新读 data/{city}_stores.csv，页面上显示文件修改时间。
 你重新跑一次抓取，刷新页面就是新数据，不用重启服务。
@@ -19,12 +20,15 @@ import json
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from data_access import cities, data_time, density_png, search, summary
+import site_eval
+from data_access import BBOX, cities, data_time, density_png, load, search, summary
 
 HOST, DEFAULT_PORT = "127.0.0.1", 5000
 REFRESH_SECONDS = 30          # 页面自动刷新间隔
+STATIC_DIR = Path(__file__).resolve().parent / "static"   # leaflet 等本地静态文件
 
 CSS = """
 body{font-family:"Microsoft YaHei",Arial,sans-serif;margin:0;background:#f6f7f9;color:#222}
@@ -48,6 +52,16 @@ input,select,button{padding:7px 10px;border:1px solid #ccd2da;border-radius:6px;
 button{background:#1f2d3d;color:#fff;border:0;cursor:pointer}
 a.pager{display:inline-block;padding:5px 10px;border:1px solid #ccd2da;border-radius:6px;color:#1f2d3d;text-decoration:none;margin-right:6px;font-size:13px}
 img{max-width:100%;border:1px solid #e3e6ea;border-radius:8px;background:#fff}
+.mapbox{background:#fff;border:1px solid #e3e6ea;border-radius:8px;padding:14px 16px;margin:18px 0}
+.mapwrap{display:flex;gap:16px;flex-wrap:wrap}
+#map{flex:2;min-width:420px;height:420px;border:1px solid #d6dbe2;border-radius:8px;cursor:crosshair;background:#f0f3f7}
+.verdict{flex:1;min-width:260px;max-width:420px;font-size:13px;line-height:1.7}
+.verdict ul{padding-left:18px;margin:8px 0}
+.verdict li{margin-bottom:6px}
+.score{font-size:20px;font-weight:700;margin-bottom:4px}
+.score span{font-size:14px;color:#44505f;font-weight:400}
+.legend{font-size:12px;color:#5a6673;margin-top:10px}
+.legend i{margin-right:4px}
 """
 
 
@@ -62,6 +76,156 @@ def page(title, body, city=None, auto_refresh=False):
 </nav><span style="margin-left:auto;font-size:12px;color:#cfd8e3">
   数据时间：{data_time(city) if city else "—"} ｜ 页面每 {REFRESH_SECONDS} 秒刷新
 </span></header><main>{body}</main></body></html>"""
+
+
+def map_section(city):
+    """地图点选评估：Leaflet + 高德底图，点一下调 /api/site。"""
+    b = BBOX.get(city)
+    rows = load(city)
+    if not b or not rows:
+        return '<div class="warn">还没有数据，无法显示地图。先跑一次采集。</div>'
+
+    # 静态文件在不在，先自己检查一遍（比让浏览器报 404 更早发现问题）
+    missing = [n for n in ("leaflet.js", "leaflet.css")
+               if not (STATIC_DIR / n).is_file()]
+    if missing:
+        return f"""<div class="mapbox"><div class="warn">
+<b>缺静态文件：{', '.join(missing)}</b><br>
+服务端在 <code>{STATIC_DIR}</code> 找不到它们，所以地图加载不了。<br>
+修复：确认 <code>web\\static\\leaflet.js</code> 和 <code>leaflet.css</code> 存在；
+没有的话运行 <code>python tools\\fetch_leaflet.py</code> 重新下载，或从别的副本拷过来。<br>
+<span class="hint">当前城市数据：{len(rows)} 条（地图不受影响，只是画不出来）</span>
+</div></div>"""
+
+    colors = {"咖啡": "#c0392b", "地铁站": "#2980b9", "写字楼": "#95a5a6",
+              "商场": "#8e44ad", "酒店": "#16a085", "景区": "#d35400"}
+    points, counts = [], {}
+    for r in rows:
+        cat = r.get("category")
+        if cat not in colors or r.get("lng_f") is None:
+            continue
+        counts[cat] = counts.get(cat, 0) + 1
+        points.append([round(r["lat_f"], 6), round(r["lng_f"], 6), cat,
+                       (r.get("name") or "")[:24]])
+
+    legend = "".join(
+        f'<span style="margin-right:14px"><i style="display:inline-block;width:9px;'
+        f'height:9px;background:{c};border-radius:50%"></i>{k} {counts.get(k, 0)}</span>'
+        for k, c in colors.items())
+
+    center = [(b["lat_min"] + b["lat_max"]) / 2, (b["lng_min"] + b["lng_max"]) / 2]
+
+    js = """
+<link rel="stylesheet" href="/static/leaflet.css?v=1">
+<script>
+// 先把脚本错误显示出来，避免"页面一片空白却不知道为什么"
+window.addEventListener('error', function (ev) {
+  var v = document.getElementById('verdict');
+  if (v) v.innerHTML = '<div class="warn">页面脚本出错：' + (ev.message || ev.type) +
+      '<br>打开 F12 控制台看详细信息。</div>';
+}, true);
+</script>
+<script src="/static/leaflet.js?v=1"></script>
+<script>
+const CITY = __CITY__, BBOX = __BBOX__, COLORS = __COLORS__, POINTS = __POINTS__;
+const verdict = document.getElementById('verdict');
+const mapEl = document.getElementById('map');
+
+if (typeof L === 'undefined') {
+  // 自己把真实原因查出来：是 404、还是网络失败
+  mapEl.innerHTML = '<div style="padding:24px;color:#b3261e;line-height:1.8">' +
+    '<b>Leaflet 没加载成功</b><br>正在检查 /static/leaflet.js …</div>';
+  fetch('/static/leaflet.js?v=1', {cache: 'no-store'}).then(function (r) {
+    var tip = r.status === 404
+      ? '服务端没有这个文件：确认 web/static/leaflet.js 存在（不存在就运行 python tools/fetch_leaflet.py），<br>或者服务还是旧进程 —— 按 Ctrl+C 重新 python web/server.py。'
+      : '按 Ctrl+F5 强刷一次；还不行就把这段截图发我。';
+    mapEl.innerHTML = '<div style="padding:24px;color:#b3261e;line-height:1.8">' +
+      '<b>Leaflet 没加载成功</b><br>' +
+      '/static/leaflet.js 返回 <b>HTTP ' + r.status + '</b><br>' + tip + '</div>';
+  }).catch(function (e) {
+    mapEl.innerHTML = '<div style="padding:24px;color:#b3261e;line-height:1.8">' +
+      '<b>Leaflet 没加载成功</b><br>请求 /static/leaflet.js 出错：' + e + '</div>';
+  });
+  verdict.innerHTML = '<div class="warn">地图脚本未加载，评估不可用。</div>';
+} else {
+  const map = L.map('map', {zoomControl: true, preferCanvas: true});
+  map.setView(__CENTER__, 12);
+
+  const tiles = L.tileLayer(
+    'https://webrd0{s}.is.autonavi.com/appmaptile?lang=zh_cn&size=1&scale=1&style=8&x={x}&y={y}&z={z}',
+    {subdomains: ['1', '2', '3', '4'], maxZoom: 19, minZoom: 9,
+     attribution: '© 高德地图（GCJ-02）'});
+  tiles.on('tileerror', function () {
+    if (!window.__tileWarned) {
+      window.__tileWarned = 1;
+      verdict.innerHTML = '<div class="warn">底图瓦片加载失败（可能网络受限）。' +
+        '点位和点选评估仍然可用。</div>';
+    }
+  });
+  tiles.addTo(map);
+
+  // 设施点位：用 canvas 渲染，上万点也不卡
+  const canvas = L.canvas({padding: 0.5});
+  const big = POINTS.length > 3000;      // 点多的时候不绑 tooltip，避免卡顿
+  POINTS.forEach(function (p) {
+    const m = L.circleMarker([p[0], p[1]], {
+      renderer: canvas,
+      radius: p[2] === '咖啡' ? 3.5 : 2.6,
+      color: COLORS[p[2]], fillColor: COLORS[p[2]],
+      fillOpacity: 0.75, weight: 0.5
+    });
+    if (!big) { m.bindTooltip(p[2] + (p[3] ? '：' + p[3] : '')); }
+    m.addTo(map);
+  });
+
+  let pick = null;
+  map.on('click', async function (e) {
+    const lat = e.latlng.lat, lng = e.latlng.lng;
+    if (pick) { map.removeLayer(pick); }
+    pick = L.circleMarker([lat, lng], {radius: 9, color: '#111', weight: 2,
+                                       fillColor: '#fff', fillOpacity: 0.9}).addTo(map);
+
+    verdict.innerHTML = '<div class="hint">计算中…</div>';
+    try {
+      const url = '/api/site?city=' + encodeURIComponent(CITY) +
+                  '&lng=' + lng.toFixed(6) + '&lat=' + lat.toFixed(6);
+      const d = await (await fetch(url)).json();
+      if (!d.ok) { verdict.innerHTML = '<div class="warn">' + d.error + '</div>'; return; }
+      const html =
+        '<div class="score" style="color:' + d.colour + '">' + d.level +
+        ' <span>' + (d.score * 100).toFixed(0) + ' 分</span></div>' +
+        '<div class="hint">位置 ' + d.lng.toFixed(4) + ', ' + d.lat.toFixed(4) + '</div>' +
+        '<ul>' + d.reasons.map(function (x) { return '<li>' + x + '</li>'; }).join('') + '</ul>' +
+        '<div class="hint">需求分位 ' + (d.demand.percentile * 100).toFixed(0) +
+        '% ｜ 竞争分位 ' + (d.competition.percentile * 100).toFixed(0) +
+        '% ｜ 最近同类 ' + d.competition.nearest_m + ' m</div>';
+      verdict.innerHTML = html;
+      L.popup().setLatLng([lat, lng]).setContent(html).openOn(map);
+    } catch (err) {
+      verdict.innerHTML = '<div class="warn">请求失败：' + err + '</div>';
+    }
+  });
+}
+</script>"""
+
+    js = (js.replace("__CITY__", json.dumps(city, ensure_ascii=False))
+            .replace("__BBOX__", json.dumps(b))
+            .replace("__COLORS__", json.dumps(colors, ensure_ascii=False))
+            .replace("__POINTS__", json.dumps(points, ensure_ascii=False))
+            .replace("__CENTER__", json.dumps(center)))
+
+    return f"""
+<div class="mapbox">
+  <h3 style="margin:0 0 6px">🗺️ 选址评估：在地图上点一个位置</h3>
+  <p class="hint">底图是高德（与点位同为 GCJ-02 坐标，不会偏移）。
+     点任意位置，用已有的咖啡店 / 地铁站 / 写字楼 / 商场数据判断适不适合开店。</p>
+  <div class="mapwrap">
+    <div id="map"></div>
+    <div id="verdict" class="verdict">点击地图上的任意位置开始评估。</div>
+  </div>
+  <div class="legend">{legend}</div>
+</div>
+{js}"""
 
 
 def render_home(qs):
@@ -104,6 +268,7 @@ def render_home(qs):
   <span class="hint">当前城市：{city} ｜ 数据时间：{s['data_time']}</span>
 </form>
 {cards}
+{map_section(city)}
 <h3 style="margin:18px 0 8px">门店分布</h3>
 <img src="/chart.png?city={city}&t={s['data_time']}" alt="分布图">
 <div style="display:flex;gap:16px;flex-wrap:wrap;margin-top:18px">
@@ -189,6 +354,43 @@ class Handler(BaseHTTPRequestHandler):
                 cs = cities()
                 city = (qs.get("city") or [cs[0] if cs else ""])[0]
                 self._send(200, json.dumps(summary(city), ensure_ascii=False, indent=2),
+                           "application/json; charset=utf-8")
+            elif path.startswith("/static/"):
+                name = path[len("/static/"):]
+                fp = STATIC_DIR / name
+                ok = (".." not in name and name and fp.is_file()
+                      and STATIC_DIR.resolve() in fp.resolve().parents)
+                if not ok:
+                    self._send(404, f"static not found: {name}", "text/plain; charset=utf-8")
+                else:
+                    ctype = ("text/css" if name.endswith(".css")
+                             else "application/javascript" if name.endswith(".js")
+                             else "application/octet-stream")
+                    self._send(200, fp.read_bytes(), f"{ctype}; charset=utf-8")
+            elif path == "/api/diag":
+                cs = cities()
+                info = {
+                    "static_dir": str(STATIC_DIR),
+                    "static_files": {n: (STATIC_DIR / n).is_file()
+                                     for n in ("leaflet.js", "leaflet.css")},
+                    "data_dir": str(site_eval.DATA),
+                    "cities": {c: len(site_eval.load(c)) for c in cs},
+                }
+                self._send(200, json.dumps(info, ensure_ascii=False, indent=2),
+                           "application/json; charset=utf-8")
+            elif path == "/api/site":
+                cs = cities()
+                city = (qs.get("city") or [cs[0] if cs else ""])[0]
+                try:
+                    lng = float((qs.get("lng") or ["0"])[0])
+                    lat = float((qs.get("lat") or ["0"])[0])
+                except ValueError:
+                    self._send(400, json.dumps({"ok": False, "error": "经纬度不合法"},
+                                               ensure_ascii=False),
+                               "application/json; charset=utf-8")
+                    return
+                result = site_eval.evaluate(city, lng, lat)
+                self._send(200, json.dumps(result, ensure_ascii=False),
                            "application/json; charset=utf-8")
             elif path == "/chart.png":
                 cs = cities()
