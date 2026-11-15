@@ -113,13 +113,21 @@ def map_section(city):
         f'height:9px;background:{c};border-radius:50%"></i>{k} {counts.get(k, 0)}</span>'
         for k, c in colors.items())
 
-    center = [(b["lat_min"] + b["lat_max"]) / 2, (b["lng_min"] + b["lng_max"]) / 2]
+    # 地图初始视野：落在咖啡店最密集的位置（用中位数，抗离群）
+    coffee_pts = [p for p in points if p[2] == "咖啡"]
+    if coffee_pts:
+        lats = sorted(p[0] for p in coffee_pts)
+        lngs = sorted(p[1] for p in coffee_pts)
+        center = [lats[len(lats) // 2], lngs[len(lngs) // 2]]
+    else:
+        center = [(b["lat_min"] + b["lat_max"]) / 2, (b["lng_min"] + b["lng_max"]) / 2]
 
     js = """
 <link rel="stylesheet" href="/static/leaflet.css?v=1">
 <script>
-// 先把脚本错误显示出来，避免"页面一片空白却不知道为什么"
+// 只报真正的脚本错误；图片/资源加载失败不算（否则图表 404 会误报）
 window.addEventListener('error', function (ev) {
+  if (!ev.message) return;
   var v = document.getElementById('verdict');
   if (v) v.innerHTML = '<div class="warn">页面脚本出错：' + (ev.message || ev.type) +
       '<br>打开 F12 控制台看详细信息。</div>';
@@ -150,6 +158,11 @@ if (typeof L === 'undefined') {
 } else {
   const map = L.map('map', {zoomControl: true, preferCanvas: true});
   map.setView(__CENTER__, 12);
+  if (POINTS.length) {
+    // 自动缩放到所有点：一次看到全城，而不是只看到中心那一小块
+    map.fitBounds(L.latLngBounds(POINTS.map(function (p) { return [p[0], p[1]]; })),
+                  {padding: [24, 24], maxZoom: 13});
+  }
 
   const tiles = L.tileLayer(
     'https://webrd0{s}.is.autonavi.com/appmaptile?lang=zh_cn&size=1&scale=1&style=8&x={x}&y={y}&z={z}',
@@ -228,6 +241,20 @@ if (typeof L === 'undefined') {
 {js}"""
 
 
+def chart_block(city, summary_data):
+    """分布图：matplotlib 不可用时给出明确提示，而不是一个破图。"""
+    try:
+        png = density_png(city)
+    except Exception as exc:
+        return (f'<div class="warn">分布图生成失败：{type(exc).__name__}: {exc}</div>')
+    if not png:
+        return ('<div class="warn">分布图暂时不可用：<br>'
+                '① 没装 matplotlib（<code>pip install matplotlib</code>）；或 '
+                '② 这个城市还没有咖啡数据。</div>')
+    return (f'<img src="/chart.png?city={city}&t={summary_data["data_time"]}" '
+            f'alt="{city} 咖啡门店分布">')
+
+
 def render_home(qs):
     cs = cities()
     if not cs:
@@ -270,7 +297,7 @@ def render_home(qs):
 {cards}
 {map_section(city)}
 <h3 style="margin:18px 0 8px">门店分布</h3>
-<img src="/chart.png?city={city}&t={s['data_time']}" alt="分布图">
+{chart_block(city, s)}
 <div style="display:flex;gap:16px;flex-wrap:wrap;margin-top:18px">
   <div style="flex:1;min-width:280px">
     <h3>品类构成</h3>
