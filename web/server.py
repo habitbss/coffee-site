@@ -54,12 +54,26 @@ a.pager{display:inline-block;padding:5px 10px;border:1px solid #ccd2da;border-ra
 img{max-width:100%;border:1px solid #e3e6ea;border-radius:8px;background:#fff}
 .mapbox{background:#fff;border:1px solid #e3e6ea;border-radius:8px;padding:14px 16px;margin:18px 0}
 .mapwrap{display:flex;gap:16px;flex-wrap:wrap}
-#map{flex:2;min-width:420px;height:420px;border:1px solid #d6dbe2;border-radius:8px;cursor:crosshair;background:#f0f3f7}
-.verdict{flex:1;min-width:260px;max-width:420px;font-size:13px;line-height:1.7}
+#map{flex:2;min-width:420px;height:460px;border:1px solid #d6dbe2;border-radius:8px;cursor:crosshair;background:#f0f3f7}
+.side{flex:1;min-width:300px;max-width:400px;display:flex;flex-direction:column;gap:10px}
+.verdict{font-size:13px;line-height:1.7}
 .verdict ul{padding-left:18px;margin:8px 0}
 .verdict li{margin-bottom:6px}
 .score{font-size:20px;font-weight:700;margin-bottom:4px}
 .score span{font-size:14px;color:#44505f;font-weight:400}
+.topbox{border:1px solid #e3e6ea;border-radius:8px;padding:10px 12px;background:#fbfcfe}
+.tophead{display:flex;align-items:center;gap:8px;font-size:13px;margin-bottom:6px}
+.tophead .hint{margin:0;font-size:11px}
+.mini{margin-left:auto;padding:2px 8px;font-size:11px;background:#1f2d3d;color:#fff;
+      border:0;border-radius:4px;cursor:pointer}
+.toplist{list-style:none;padding:0;margin:0;max-height:300px;overflow:auto}
+.toplist li{padding:6px 8px;border:1px solid #e6e9ee;border-radius:6px;margin-bottom:6px;
+            cursor:pointer;background:#fff;font-size:13px}
+.toplist li:hover{background:#eef4ff;border-color:#b9cdf0}
+.toplist .rk{font-weight:700;color:#1f2d3d;margin-right:6px}
+.toplist .lv{margin-right:6px;font-weight:600}
+.toplist .sc{color:#44505f;font-size:12px}
+.toplist .meta{color:#6b7785;font-size:11px;margin-top:2px}
 .legend{font-size:12px;color:#5a6673;margin-top:10px}
 .legend i{margin-right:4px}
 """
@@ -192,11 +206,11 @@ if (typeof L === 'undefined') {
   });
 
   let pick = null;
-  map.on('click', async function (e) {
-    const lat = e.latlng.lat, lng = e.latlng.lng;
+  async function evalAt(lat, lng, fly) {
     if (pick) { map.removeLayer(pick); }
     pick = L.circleMarker([lat, lng], {radius: 9, color: '#111', weight: 2,
                                        fillColor: '#fff', fillOpacity: 0.9}).addTo(map);
+    if (fly) { map.setView([lat, lng], 15); }
 
     verdict.innerHTML = '<div class="hint">计算中…</div>';
     try {
@@ -217,7 +231,61 @@ if (typeof L === 'undefined') {
     } catch (err) {
       verdict.innerHTML = '<div class="warn">请求失败：' + err + '</div>';
     }
-  });
+  }
+
+  map.on('click', function (e) { evalAt(e.latlng.lat, e.latlng.lng, false); });
+
+  // ---------------- 右侧：实时 Top10 候选点 ----------------
+  const topList = document.getElementById('toplist');
+  const topUpd = document.getElementById('topupd');
+  let topMarkers = [];
+
+  function drawTop(items) {
+    topMarkers.forEach(function (m) { map.removeLayer(m); });
+    topMarkers = items.map(function (it) {
+      return L.circleMarker([it.lat, it.lng], {
+        radius: 7, color: '#fff', weight: 2, fillColor: it.colour, fillOpacity: 1
+      }).bindTooltip('#' + it.rank + ' ' + it.level + ' ' + Math.round(it.score * 100) + ' 分')
+        .addTo(map);
+    });
+  }
+
+  async function loadTop() {
+    topUpd.textContent = '计算中…';
+    try {
+      const r = await fetch('/api/top?city=' + encodeURIComponent(CITY) + '&n=10',
+                            {cache: 'no-store'});
+      const d = await r.json();
+      if (!d.ok) { topList.innerHTML = '<li class="warn">' + d.error + '</li>'; topUpd.textContent = ''; return; }
+      if (!d.items.length) {
+        topList.innerHTML = '<li class="hint">当前数据下没有达到门槛的候选点。</li>';
+        topUpd.textContent = '更新于 ' + new Date().toLocaleTimeString();
+        return;
+      }
+      topList.innerHTML = d.items.map(function (it) {
+        return '<li data-lat="' + it.lat + '" data-lng="' + it.lng + '">' +
+          '<span class="rk">#' + it.rank + '</span>' +
+          '<span class="lv" style="color:' + it.colour + '">' + it.level + '</span>' +
+          '<span class="sc">' + Math.round(it.score * 100) + ' 分</span>' +
+          '<div class="meta">需求 ' + Math.round(it.demand) + ' ｜ 竞争 ' + it.comp +
+          ' 家 ｜ 最近 ' + it.nearest_m + ' m</div></li>';
+      }).join('');
+      topList.querySelectorAll('li[data-lat]').forEach(function (li) {
+        li.onclick = function () {
+          evalAt(parseFloat(li.dataset.lat), parseFloat(li.dataset.lng), true);
+        };
+      });
+      drawTop(d.items);
+      topUpd.textContent = '更新于 ' + new Date().toLocaleTimeString() +
+        ' ｜ 数据 ' + d.data_time.split(' ').pop();
+    } catch (err) {
+      topList.innerHTML = '<li class="warn">候选点加载失败：' + err + '</li>';
+      topUpd.textContent = '';
+    }
+  }
+
+  loadTop();
+  setInterval(loadTop, 30000);        // 每 30 秒按最新数据刷新候选点
 }
 </script>"""
 
@@ -234,7 +302,18 @@ if (typeof L === 'undefined') {
      点任意位置，用已有的咖啡店 / 地铁站 / 写字楼 / 商场数据判断适不适合开店。</p>
   <div class="mapwrap">
     <div id="map"></div>
-    <div id="verdict" class="verdict">点击地图上的任意位置开始评估。</div>
+    <div class="side">
+      <div id="verdict" class="verdict">点击地图上的任意位置开始评估。</div>
+      <div class="topbox">
+        <div class="tophead">
+          <b>🔥 候选点 Top10</b>
+          <span id="topupd" class="hint">计算中…</span>
+          <button class="mini" onclick="loadTop()">刷新</button>
+        </div>
+        <ol id="toplist" class="toplist"><li class="hint">正在按当前数据计算…</li></ol>
+        <p class="hint">点某一条 → 地图飞到该点并给出评估；每 30 秒按最新数据自动刷新。</p>
+      </div>
+    </div>
   </div>
   <div class="legend">{legend}</div>
 </div>
@@ -394,6 +473,18 @@ class Handler(BaseHTTPRequestHandler):
                              else "application/javascript" if name.endswith(".js")
                              else "application/octet-stream")
                     self._send(200, fp.read_bytes(), f"{ctype}; charset=utf-8")
+            elif path == "/api/top":
+                cs = cities()
+                city = (qs.get("city") or [cs[0] if cs else ""])[0]
+                try:
+                    n = max(1, min(50, int((qs.get("n") or ["10"])[0])))
+                except ValueError:
+                    n = 10
+                items = site_eval.top_candidates(city, n)
+                self._send(200, json.dumps(
+                    {"ok": True, "city": city, "data_time": data_time(city),
+                     "items": items}, ensure_ascii=False),
+                    "application/json; charset=utf-8")
             elif path == "/api/diag":
                 cs = cities()
                 info = {

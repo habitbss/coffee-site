@@ -14,6 +14,7 @@
 "分位"是这个点在全城所有网格里的排名百分位，所以不同城市可以直接比。
 """
 
+import bisect
 import csv
 import math
 from pathlib import Path
@@ -103,6 +104,25 @@ class Grid:
                         out.append(r)
         return out
 
+    def nearest_km(self, lng, lat, max_ring: int = 8):
+        """一圈圈往外找最近点，避免对全部点做 O(N) 距离计算。"""
+        if not self.buckets:
+            return 5.0
+        ci, cj = self._key(lng, lat)
+        for ring in range(0, max_ring + 1):
+            best = None
+            for i in range(ci - ring, ci + ring + 1):
+                for j in range(cj - ring, cj + ring + 1):
+                    if max(abs(i - ci), abs(j - cj)) != ring:
+                        continue          # 只看这一圈的边框
+                    for r in self.buckets.get((i, j), ()):
+                        d = _dist_km(lng, lat, r["lng_f"], r["lat_f"])
+                        if best is None or d < best:
+                            best = d
+            if best is not None:
+                return best
+        return 5.0
+
 
 _grids: dict[str, tuple[float, dict]] = {}
 
@@ -131,6 +151,94 @@ def _percentile(values, v):
     less = sum(1 for x in values if x < v)
     equal = sum(1 for x in values if x == v)
     return (less + 0.5 * equal) / len(values)
+
+
+def _level(score: float):
+    if score >= 0.65:
+        return "推荐", "#16a34a"
+    if score >= 0.5:
+        return "可以开", "#ca8a04"
+    if score >= 0.35:
+        return "谨慎", "#ea580c"
+    return "不建议", "#dc2626"
+
+
+# ---------------------------------------------------------------- 实时 Top 候选点
+_cand_cache: dict[tuple, tuple[float, list]] = {}
+
+
+def top_candidates(city: str, n: int = 10, cell: float = 0.004,
+                   min_gap_m: float = 800, min_demand_pct: float = 0.5) -> list[dict]:
+    """全城扫格子，挑出评分最高的 n 个候选点（候选点之间至少隔 min_gap_m）。
+
+    数据文件一变（mtime 变）就自动重算，所以列表是"实时"的。
+
+    只保留需求分位 >= min_demand_pct 的格子：避免把"没有店也没人流"的空地推上来。
+    """
+    path = DATA / f"{city}_stores.csv"
+    mtime = path.stat().st_mtime if path.exists() else 0.0
+    key = (city, cell, n, min_gap_m)
+    hit = _cand_cache.get(key)
+    if hit and hit[0] == mtime:
+        return hit[1]
+
+    rows = load(city)
+    bbox = BBOX.get(city)
+    if not rows or not bbox:
+        return []
+
+    g = grids(city)
+    base = city_baseline(city)
+    sd = sorted(base["demand"])
+    sc = sorted(base["comp"])
+    sn = sorted(base["nearest"])
+
+    def pct(sorted_vals, v):
+        if not sorted_vals:
+            return 0.5
+        lo = bisect.bisect_left(sorted_vals, v)
+        hi = bisect.bisect_right(sorted_vals, v)
+        return (lo + 0.5 * (hi - lo)) / len(sorted_vals)
+
+    cands = []
+    lng = bbox["lng_min"]
+    while lng <= bbox["lng_max"]:
+        lat = bbox["lat_min"]
+        while lat <= bbox["lat_max"]:
+            near_d = g["demand"].near(lng, lat, R_DEMAND)
+            if near_d:                       # 没人流设施的格子直接跳过（省时间）
+                d = sum(DEMAND_WEIGHT[r["category"]] for r in near_d)
+                p_d = pct(sd, d)
+                if p_d < min_demand_pct:     # 需求不够旺的格子不当候选
+                    lat += cell
+                    continue
+                c = len(g["coffee"].near(lng, lat, R_COMP))
+                near_km = g["coffee"].nearest_km(lng, lat)
+                score = 0.55 * p_d + 0.25 * pct(sn, near_km) - 0.20 * pct(sc, c)
+                if near_km > 3:
+                    score = min(score, 0.34)
+                elif near_km > 1.5:
+                    score = min(score, 0.45)   # 太远：可能是没需求，不是空白好机会
+                score = max(0.0, min(1.0, score))
+                if score >= 0.3:
+                    cands.append({"lng": round(lng, 6), "lat": round(lat, 6),
+                                  "score": round(score, 3), "demand": d,
+                                  "comp": c, "nearest_m": round(near_km * 1000)})
+            lat += cell
+        lng += cell
+
+    cands.sort(key=lambda x: -x["score"])
+    picked: list[dict] = []
+    for c in cands:
+        if all(_dist_km(c["lng"], c["lat"], p["lng"], p["lat"]) * 1000 >= min_gap_m
+               for p in picked):
+            level, colour = _level(c["score"])
+            picked.append({**c, "level": level, "colour": colour, "rank": len(picked) + 1})
+        if len(picked) >= n:
+            break
+
+    _cand_cache[key] = (mtime, picked)
+    return picked
 
 
 # ---------------------------------------------------------------- 全城基准（分位数）
