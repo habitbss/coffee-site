@@ -27,7 +27,8 @@ import site_eval
 from data_access import BBOX, cities, data_time, density_png, load, search, summary
 
 HOST, DEFAULT_PORT = "127.0.0.1", 5000
-REFRESH_SECONDS = 30          # 页面自动刷新间隔
+REFRESH_SECONDS = 300         # 候选点列表刷新间隔（5 分钟，只更新列表，不动地图）
+PAGE_REFRESH_SECONDS = 300    # 整页重载间隔（5 分钟，会让地图重置回默认视野）
 STATIC_DIR = Path(__file__).resolve().parent / "static"   # leaflet 等本地静态文件
 
 CSS = """
@@ -80,7 +81,8 @@ img{max-width:100%;border:1px solid #e3e6ea;border-radius:8px;background:#fff}
 
 
 def page(title, body, city=None, auto_refresh=False):
-    refresh = f'<meta http-equiv="refresh" content="{REFRESH_SECONDS}">' if auto_refresh else ""
+    refresh = (f'<meta http-equiv="refresh" content="{PAGE_REFRESH_SECONDS}">'
+               if auto_refresh else "")
     return f"""<!doctype html><html lang="zh"><head><meta charset="utf-8">
 {refresh}<title>{title}</title><style>{CSS}</style></head><body>
 <header><b>咖啡选址 · 实时数据</b><nav>
@@ -88,7 +90,8 @@ def page(title, body, city=None, auto_refresh=False):
   <a href="/stores">门店列表</a>
   <a href="/api/summary">API</a>
 </nav><span style="margin-left:auto;font-size:12px;color:#cfd8e3">
-  数据时间：{data_time(city) if city else "—"} ｜ 页面每 {REFRESH_SECONDS} 秒刷新
+  数据时间：{data_time(city) if city else "—"} ｜ 候选点每 {REFRESH_SECONDS // 60} 分钟刷新
+  ｜ 地图每 {PAGE_REFRESH_SECONDS // 60} 分钟重置
 </span></header><main>{body}</main></body></html>"""
 
 
@@ -238,6 +241,7 @@ if (typeof L === 'undefined') {
   // ---------------- 右侧：实时 Top10 候选点 ----------------
   const topList = document.getElementById('toplist');
   const topUpd = document.getElementById('topupd');
+  const topSum = document.getElementById('topsum');
   let topMarkers = [];
 
   function drawTop(items) {
@@ -263,13 +267,24 @@ if (typeof L === 'undefined') {
         return;
       }
       topList.innerHTML = d.items.map(function (it) {
+        var huff = '';
+        if (it.huff_share !== null && it.huff_share !== undefined) {
+          huff = ' ｜ Huff ' + (it.huff_share * 100).toFixed(1) + '%';
+          if (it.huff_avg) huff += '（同类均值 ' + (it.huff_avg * 100).toFixed(1) + '%）';
+        }
+        var base = (it.score_base === undefined) ? ''
+          : '（原 ' + Math.round(it.score_base * 100) + '）';
         return '<li data-lat="' + it.lat + '" data-lng="' + it.lng + '">' +
           '<span class="rk">#' + it.rank + '</span>' +
           '<span class="lv" style="color:' + it.colour + '">' + it.level + '</span>' +
-          '<span class="sc">' + Math.round(it.score * 100) + ' 分</span>' +
+          '<span class="sc">' + Math.round(it.score * 100) + ' 分' + base + '</span>' +
           '<div class="meta">需求 ' + Math.round(it.demand) + ' ｜ 竞争 ' + it.comp +
-          ' 家 ｜ 最近 ' + it.nearest_m + ' m</div></li>';
+          ' 家 ｜ 最近 ' + it.nearest_m + ' m' + huff + '</div></li>';
       }).join('');
+      if (d.stats && d.stats.n) {
+        topSum.textContent = '全城 ' + d.stats.n + ' 个候选：推荐 ' + d.stats['推荐'] +
+          ' ｜ 可以开 ' + d.stats['可以开'] + ' ｜ 谨慎 ' + d.stats['谨慎'];
+      }
       topList.querySelectorAll('li[data-lat]').forEach(function (li) {
         li.onclick = function () {
           evalAt(parseFloat(li.dataset.lat), parseFloat(li.dataset.lng), true);
@@ -285,7 +300,7 @@ if (typeof L === 'undefined') {
   }
 
   loadTop();
-  setInterval(loadTop, 30000);        // 每 30 秒按最新数据刷新候选点
+  setInterval(loadTop, __REFRESH_MS__);   // 每 N 秒按最新数据刷新候选点
 }
 </script>"""
 
@@ -293,6 +308,7 @@ if (typeof L === 'undefined') {
             .replace("__BBOX__", json.dumps(b))
             .replace("__COLORS__", json.dumps(colors, ensure_ascii=False))
             .replace("__POINTS__", json.dumps(points, ensure_ascii=False))
+            .replace("__REFRESH_MS__", str(REFRESH_SECONDS * 1000))
             .replace("__CENTER__", json.dumps(center)))
 
     return f"""
@@ -311,7 +327,8 @@ if (typeof L === 'undefined') {
           <button class="mini" onclick="loadTop()">刷新</button>
         </div>
         <ol id="toplist" class="toplist"><li class="hint">正在按当前数据计算…</li></ol>
-        <p class="hint">点某一条 → 地图飞到该点并给出评估；每 30 秒按最新数据自动刷新。</p>
+        <p id="topsum" class="hint"></p>
+        <p class="hint">点某一条 → 地图飞到该点并给出评估；每 {REFRESH_SECONDS // 60} 分钟按最新数据自动刷新。</p>
       </div>
     </div>
   </div>
@@ -483,6 +500,7 @@ class Handler(BaseHTTPRequestHandler):
                 items = site_eval.top_candidates(city, n)
                 self._send(200, json.dumps(
                     {"ok": True, "city": city, "data_time": data_time(city),
+                     "stats": site_eval.candidate_stats(city),
                      "items": items}, ensure_ascii=False),
                     "application/json; charset=utf-8")
             elif path == "/api/diag":
